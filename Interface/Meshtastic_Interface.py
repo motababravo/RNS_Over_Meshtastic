@@ -93,6 +93,9 @@ class MeshtasticInterface(Interface):
         tcp_port = ifconf["tcp_port"] if "tcp_port" in ifconf else None
         speed = int(ifconf["data_speed"]) if "data_speed" in ifconf else 8
         hop_limit = int(ifconf["hop_limit"]) if "hop_limit" in ifconf else 1
+        channel_index = int(ifconf["channel_index"]) if "channel_index" in ifconf else 0
+        if not 0 <= channel_index <= 7:
+            raise ValueError(f"channel_index must be between 0 and 7, got {channel_index}")
 
         # All interfaces must supply a hardware MTU value
         # to the RNS Transport instance. This value should
@@ -127,6 +130,7 @@ class MeshtasticInterface(Interface):
         self.dest_to_node_dict = {}
         self.packet_index = 0
         self.hop_limit = hop_limit
+        self.channel_index = channel_index
 
         pub.subscribe(self.process_message, "meshtastic.receive")
         pub.subscribe(self.connection_complete, "meshtastic.connection.established")
@@ -178,6 +182,9 @@ class MeshtasticInterface(Interface):
             ourNode.writeConfig("lora")
             self.online = False
         else:
+            channels = ourNode.channels
+            if channels and (len(channels) <= self.channel_index or channels[self.channel_index].role == 0):
+                RNS.log(f"Meshtastic: Channel index {self.channel_index} is not enabled on the radio", RNS.LOG_WARNING)
             thread = threading.Thread(target=self.write_loop)
             thread.daemon = True
             thread.start()
@@ -226,6 +233,10 @@ class MeshtasticInterface(Interface):
         # RNS.log(f'From: {packet["from"]}, payload: {packet["decoded"]["portnum"], packet["decoded"]["payload"]}')
         if "decoded" in packet:
             if packet["decoded"]["portnum"] == "RETICULUM_TUNNEL_APP":
+                from meshtastic import BROADCAST_NUM
+                # Ignore broadcast tunnel traffic on other channels (channel is omitted from the dict when 0)
+                if packet.get("to") == BROADCAST_NUM and packet.get("channel", 0) != self.channel_index:
+                    return
                 if packet["from"] not in self.expected_index:
                     self.expected_index[packet["from"]] = []
                 expected_index = self.expected_index[packet["from"]]
@@ -299,7 +310,7 @@ class MeshtasticInterface(Interface):
                                         destinationId=dest,
                                         wantAck=False,
                                         wantResponse=False,
-                                        channelIndex=0,
+                                        channelIndex=self.channel_index,
                                         hopLimit=self.hop_limit)
             time.sleep(sleep_time)  # Make sending rate dynamic
 
