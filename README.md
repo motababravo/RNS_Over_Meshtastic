@@ -20,6 +20,8 @@ Interface for RNS using Meshtastic as the underlying networking layer to utilize
   tcp_port = 127.0.0.1:4403  #Optional: Meshtastic TCP IP. [port is optional if using default port] (Replacement for serial or ble)
   data_speed = 8  # Radio speed setting desired for the network(do not use long-fast)
   channel_index = 0  # Optional: Meshtastic channel index (0-7) to tunnel over. Local slot of the tunnel channel on this radio; other nodes may use a different slot as long as name/PSK match [default 0, primary]
+  hop_limit = 1  # Optional: Meshtastic hop limit (0-7) for tunnel packets [default 1]
+  bitrate = 500  # Optional: Bitrate in bits/s reported to Reticulum (used for announce bandwidth and rnstatus); does not change the radio speed [default 500]
 ```
 
 - Radio settings and their associated transfer speeds are shown below; time unit is seconds between packets (from [Meshtastic_Interface.py](Interface%2FMeshtastic_Interface.py))

@@ -111,7 +111,7 @@ class MeshtasticInterface(Interface):
 
         # In this case, we can also set the indicated bit-
         # rate of the interface to the serial port speed.
-        self.bitrate = ifconf["bitrate"] if "bitrate" in ifconf else 500
+        self.bitrate = int(ifconf["bitrate"]) if "bitrate" in ifconf else 500
 
         # Configure internal properties on the interface
         # according to the supplied configuration.
