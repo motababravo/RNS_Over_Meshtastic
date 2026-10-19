@@ -131,6 +131,7 @@ class MeshtasticInterface(Interface):
         self.tcp_port = tcp_port
         self.speed = speed
         self.timeout = 100
+        self.reconnect_delay = 10
         self.interface = None
         self.outgoing_packet_storage = {}
         self.packet_i_queue = []
@@ -143,6 +144,9 @@ class MeshtasticInterface(Interface):
         self.channel_index = channel_index
         self.announce_max_hops = announce_max_hops
         self.fragment_size = fragment_size
+        self.write_thread = None
+        self.reconnecting = False
+        self.reconnect_lock = threading.Lock()
 
         pub.subscribe(self.process_message, "meshtastic.receive")
         pub.subscribe(self.connection_complete, "meshtastic.connection.established")
@@ -197,9 +201,10 @@ class MeshtasticInterface(Interface):
             channels = ourNode.channels
             if channels and (len(channels) <= self.channel_index or channels[self.channel_index].role == 0):
                 RNS.log(f"Meshtastic: Channel index {self.channel_index} is not enabled on the radio", RNS.LOG_WARNING)
-            thread = threading.Thread(target=self.write_loop)
-            thread.daemon = True
-            thread.start()
+            if self.write_thread is None or not self.write_thread.is_alive():  # Only one loop across reconnects
+                self.write_thread = threading.Thread(target=self.write_loop)
+                self.write_thread.daemon = True
+                self.write_thread.start()
             self.online = True
 
     def check_dest_incoming(self, data, from_addr):
@@ -318,6 +323,9 @@ class MeshtasticInterface(Interface):
         sleep_time = self.speed_to_delay[self.speed] if self.speed in self.speed_to_delay else 7
         import meshtastic
         while True:
+            if not self.online:  # Hold the queue while the radio is away
+                time.sleep(sleep_time)
+                continue
             data = None
             dest = meshtastic.BROADCAST_ADDR
             while not data and self.packet_i_queue:
@@ -331,27 +339,67 @@ class MeshtasticInterface(Interface):
                 # and ensure that all data was written
                 self.txb += len(data) - 2  # -2 for overhead
                 # RNS.log(f'Sending on dest: {dest}')
-                self.interface.sendData(data,
-                                        portNum=self.mt_bin_port,
-                                        destinationId=dest,
-                                        wantAck=False,
-                                        wantResponse=False,
-                                        channelIndex=self.channel_index,
-                                        hopLimit=self.hop_limit)
+                try:
+                    self.interface.sendData(data,
+                                            portNum=self.mt_bin_port,
+                                            destinationId=dest,
+                                            wantAck=False,
+                                            wantResponse=False,
+                                            channelIndex=self.channel_index,
+                                            hopLimit=self.hop_limit)
+                except Exception as e:  # Radio went away mid-send; the lost fragment is re-requested
+                    RNS.log(f"Meshtastic: Send failed: {e}", RNS.LOG_WARNING)
             time.sleep(sleep_time)  # Make sending rate dynamic
 
     def connection_complete(self, interface):
         """Process meshtastic connection opened"""
         RNS.log("Meshtastic: Connected")
-        self.configure_device(interface)
         self.interface = interface
+        self.configure_device(interface)
 
     def connection_closed(self, interface):
-        """Process meshtastic traffic incoming to system"""
-        RNS.log("Meshtastic: Disconnected")
+        """Process meshtastic connection lost"""
+        if interface is not self.interface:
+            return  # Stale event from an interface that has already been replaced
+        RNS.log("Meshtastic: Disconnected", RNS.LOG_WARNING)
         self.online = False
-        time.sleep(10)  # Wait before restarting
-        self.open_interface()
+        with self.reconnect_lock:
+            if self.reconnecting:
+                return
+            self.reconnecting = True
+        # Reconnect on our own thread: this callback runs on meshtastic's publishing thread,
+        # which has to stay free to deliver the events of the new connection
+        thread = threading.Thread(target=self.reconnect_loop, args=(interface,))
+        thread.daemon = True
+        thread.start()
+
+    def reconnect_loop(self, old_interface):
+        """Reopen the radio until it is back, retrying every reconnect_delay seconds"""
+        try:
+            # When the radio reboots behind a USB-serial bridge the port stays open, and the
+            # meshtastic library downloads the config again on the same interface by itself.
+            # Give it the chance while its reader thread is still alive.
+            reader = getattr(old_interface, "_rxThread", None)
+            deadline = time.time() + 30
+            while reader is not None and reader.is_alive() and time.time() < deadline:
+                if old_interface.isConnected.wait(1):
+                    return  # connection_complete has brought the interface back online
+            try:
+                old_interface.close()
+            except Exception:
+                pass
+            while True:
+                time.sleep(self.reconnect_delay)
+                try:
+                    RNS.log("Meshtastic: Reconnecting...", RNS.LOG_NOTICE)
+                    self.open_interface()
+                    return
+                except Exception as e:
+                    RNS.log(f"Meshtastic: Reconnect failed ({e}), retrying in {self.reconnect_delay}s",
+                            RNS.LOG_WARNING)
+        finally:
+            with self.reconnect_lock:
+                self.reconnecting = False
 
     # Signal to Reticulum that this interface should
     # not perform any ingress limiting.
