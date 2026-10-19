@@ -21,6 +21,8 @@ Interface for RNS using Meshtastic as the underlying networking layer to utilize
   data_speed = 8  # Radio speed setting desired for the network(do not use long-fast)
   channel_index = 0  # Optional: Meshtastic channel index (0-7) to tunnel over. Local slot of the tunnel channel on this radio; other nodes may use a different slot as long as name/PSK match [default 0, primary]
   hop_limit = 1  # Optional: Meshtastic hop limit (0-7) for tunnel packets [default 1]
+  fragment_size = 200  # Optional: Bytes of RNS data per Meshtastic packet (32-200). Use 155 if traffic passes through gateways using meshtasticd's simulated radio (e.g. RepeaterTastic). Nodes may use different values [default 200]
+  announce_max_hops = 2  # Optional: Drop outgoing announces that have travelled more than this many RNS hops (path responses are still sent). Useful on transport nodes so the backbone isn't re-announced onto LoRa. Has no effect with IFAC enabled [default off]
   bitrate = 500  # Optional: Bitrate in bits/s reported to Reticulum (used for announce bandwidth and rnstatus); does not change the radio speed [default 500]
 ```
 
@@ -37,3 +39,6 @@ speed_to_delay = {8: .4,  # Short-range Turbo (recommended)
                   }
 ```
 - Use the number on the left to set the speed and change the number on the right to change the max transmission rate from the radio
+
+## Credits
+- `fragment_size` and `announce_max_hops` are adopted from the [ScotMesh fork](https://github.com/ScotMesh/RNS_Over_Meshtastic)

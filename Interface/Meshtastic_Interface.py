@@ -93,9 +93,19 @@ class MeshtasticInterface(Interface):
         tcp_port = ifconf["tcp_port"] if "tcp_port" in ifconf else None
         speed = int(ifconf["data_speed"]) if "data_speed" in ifconf else 8
         hop_limit = int(ifconf["hop_limit"]) if "hop_limit" in ifconf else 1
+        if not 0 <= hop_limit <= 7:  # Meshtastic hop_limit is a 3-bit field
+            raise ValueError(f"hop_limit must be between 0 and 7, got {hop_limit}")
         channel_index = int(ifconf["channel_index"]) if "channel_index" in ifconf else 0
         if not 0 <= channel_index <= 7:
             raise ValueError(f"channel_index must be between 0 and 7, got {channel_index}")
+        announce_max_hops = int(ifconf["announce_max_hops"]) if "announce_max_hops" in ifconf else None
+        # Bytes of RNS data per Meshtastic packet (each also carries a 2-byte header). Senders and
+        # receivers may use different sizes. Use 155 when going through gateways that hand frames to
+        # meshtasticd's simulated radio (e.g. RepeaterTastic), which take at most 230 bytes of
+        # encrypted Data once meshtasticd 2.8 adds its 64-byte signature.
+        fragment_size = int(ifconf["fragment_size"]) if "fragment_size" in ifconf else 200
+        if not 32 <= fragment_size <= 200:
+            raise ValueError(f"fragment_size must be between 32 and 200, got {fragment_size}")
 
         # All interfaces must supply a hardware MTU value
         # to the RNS Transport instance. This value should
@@ -131,6 +141,8 @@ class MeshtasticInterface(Interface):
         self.packet_index = 0
         self.hop_limit = hop_limit
         self.channel_index = channel_index
+        self.announce_max_hops = announce_max_hops
+        self.fragment_size = fragment_size
 
         pub.subscribe(self.process_message, "meshtastic.receive")
         pub.subscribe(self.connection_complete, "meshtastic.connection.established")
@@ -216,17 +228,31 @@ class MeshtasticInterface(Interface):
     # call this method on the interface whenever the
     # interface must transmit a packet.
     def process_outgoing(self, data: bytes):
+        if self.announce_exceeds_hops(data, self.announce_max_hops):
+            return
         if len(self.packet_i_queue) < 256:
             # Then write the framed data to the port
             from meshtastic import BROADCAST_ADDR
             dest = BROADCAST_ADDR
             if data[2:18] in self.dest_to_node_dict:  # lookup to see if destination is found
                 dest = self.dest_to_node_dict[data[2:18]]
-            handler = PacketHandler(data, self.packet_index, custom_destination_id=dest)
+            handler = PacketHandler(data, self.packet_index, max_payload=self.fragment_size,
+                                    custom_destination_id=dest)
             for key in handler.get_keys():
                 self.packet_i_queue.append((handler.index, key))
             self.outgoing_packet_storage[handler.index] = handler
             self.packet_index = calc_index(self.packet_index)
+
+    @staticmethod
+    def announce_exceeds_hops(data: bytes, max_hops):
+        """True for an RNS announce that has travelled more than max_hops to reach this
+        node. Path responses are exempt so on-demand path lookups still work."""
+        if max_hops is None or len(data) < 19 or data[0] & 0b11 != RNS.Packet.ANNOUNCE:
+            return False
+        context_offset = 34 if data[0] & 0b01000000 else 18  # HEADER_2 carries a 16-byte transport id
+        if len(data) > context_offset and data[context_offset] == RNS.Packet.PATH_RESPONSE:
+            return False
+        return data[1] > max_hops
 
     def process_message(self, packet, interface):
         """Process meshtastic traffic incoming to system"""
