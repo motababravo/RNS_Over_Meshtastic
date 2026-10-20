@@ -132,6 +132,7 @@ class MeshtasticInterface(Interface):
         self.speed = speed
         self.timeout = 100
         self.reconnect_delay = 10
+        self.watchdog_timeout = 60  # Force a reconnect after being down this long, whatever the cause
         self.interface = None
         self.outgoing_packet_storage = {}
         self.packet_i_queue = []
@@ -162,6 +163,9 @@ class MeshtasticInterface(Interface):
 
         # If opening the port succeeded, run any post-open
         # configuration required.
+        thread = threading.Thread(target=self.watchdog_loop)
+        thread.daemon = True
+        thread.start()
 
     # Open the meshtastic interface with supplied configuration
     # parameters and store a reference to the open port.
@@ -355,7 +359,10 @@ class MeshtasticInterface(Interface):
         """Process meshtastic connection opened"""
         RNS.log("Meshtastic: Connected")
         self.interface = interface
-        self.configure_device(interface)
+        try:
+            self.configure_device(interface)
+        except Exception as e:  # The library swallows callback errors; the watchdog retries
+            RNS.log(f"Meshtastic: Could not configure radio: {e}", RNS.LOG_ERROR)
 
     def connection_closed(self, interface):
         """Process meshtastic connection lost"""
@@ -363,31 +370,70 @@ class MeshtasticInterface(Interface):
             return  # Stale event from an interface that has already been replaced
         RNS.log("Meshtastic: Disconnected", RNS.LOG_WARNING)
         self.online = False
+        self.start_reconnect(interface, wait_for_library=True)
+
+    def start_reconnect(self, old_interface, wait_for_library):
+        """Run reconnect_loop unless one is already running"""
         with self.reconnect_lock:
             if self.reconnecting:
                 return
             self.reconnecting = True
-        # Reconnect on our own thread: this callback runs on meshtastic's publishing thread,
+        # Reconnect on our own thread: connection_closed runs on meshtastic's publishing thread,
         # which has to stay free to deliver the events of the new connection
-        thread = threading.Thread(target=self.reconnect_loop, args=(interface,))
+        thread = threading.Thread(target=self.reconnect_loop, args=(old_interface, wait_for_library))
         thread.daemon = True
         thread.start()
 
-    def reconnect_loop(self, old_interface):
-        """Reopen the radio until it is back, retrying every reconnect_delay seconds"""
-        try:
-            # When the radio reboots behind a USB-serial bridge the port stays open, and the
-            # meshtastic library downloads the config again on the same interface by itself.
-            # Give it the chance while its reader thread is still alive.
-            reader = getattr(old_interface, "_rxThread", None)
-            deadline = time.time() + 30
-            while reader is not None and reader.is_alive() and time.time() < deadline:
-                if old_interface.isConnected.wait(1):
-                    return  # connection_complete has brought the interface back online
+    def watchdog_loop(self):
+        """Catch-all: force a reconnect whenever the interface has been down for watchdog_timeout"""
+        down_since = None
+        while True:
+            time.sleep(self.reconnect_delay)
+            interface = self.interface
+            if self.online and interface is not None and interface.isConnected.is_set():
+                down_since = None
+            elif down_since is None:
+                down_since = time.time()
+            elif time.time() - down_since >= self.watchdog_timeout and not self.reconnecting:
+                RNS.log(f"Meshtastic: Down for {self.watchdog_timeout}s, forcing a reconnect", RNS.LOG_WARNING)
+                self.online = False
+                down_since = None
+                self.start_reconnect(interface, wait_for_library=False)
+
+    def close_interface(self, interface):
+        """Close an interface without hanging, and make sure its port is released"""
+        def close():
             try:
-                old_interface.close()
+                interface.close()
             except Exception:
                 pass
+        closer = threading.Thread(target=close)
+        closer.daemon = True
+        closer.start()
+        closer.join(15)  # close() waits for the reader thread without a timeout
+        # close() sends a disconnect to the radio before releasing the port; if that send
+        # fails the port stays locked and every reopen fails, so release it here as well
+        interface._wantExit = True
+        stream = getattr(interface, "stream", None)
+        if stream is not None:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def reconnect_loop(self, old_interface, wait_for_library):
+        """Reopen the radio until it is back, retrying every reconnect_delay seconds"""
+        try:
+            if old_interface is not None:
+                # When the radio reboots behind a USB-serial bridge the port stays open, and the
+                # meshtastic library downloads the config again on the same interface by itself.
+                # Give it the chance while its reader thread is still alive.
+                reader = getattr(old_interface, "_rxThread", None)
+                deadline = time.time() + 30
+                while wait_for_library and reader is not None and reader.is_alive() and time.time() < deadline:
+                    if old_interface.isConnected.wait(1):
+                        return  # connection_complete has brought the interface back online
+                self.close_interface(old_interface)
             while True:
                 time.sleep(self.reconnect_delay)
                 try:
