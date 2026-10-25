@@ -17,7 +17,6 @@ from RNS.Interfaces.Interface import Interface
 import struct
 import threading
 import time
-import re
 
 
 # Let's define our custom interface class. It must
@@ -139,7 +138,6 @@ class MeshtasticInterface(Interface):
         self.assembly_dict = {}
         self.expected_index = {}
         self.requested_index = {}
-        self.dest_to_node_dict = {}
         self.packet_index = 0
         self.hop_limit = hop_limit
         self.channel_index = channel_index
@@ -155,14 +153,18 @@ class MeshtasticInterface(Interface):
 
         # Since all required parameters are now configured,
         # we will try opening the serial port.
+        if not (self.port or self.ble_port or self.tcp_port):
+            raise ValueError(f"No port, ble_port or tcp_port specified for {self}")
         try:
             self.open_interface()
         except Exception as e:
-            RNS.log("Meshtastic: Could not open meshtastic interface " + str(self), RNS.LOG_ERROR)
-            raise e
+            # Keep the interface and let the reconnect loop bring the radio up when it appears,
+            # instead of failing until rnsd is restarted
+            RNS.log(f"Meshtastic: Could not open meshtastic interface {self} ({e}), will keep retrying",
+                    RNS.LOG_ERROR)
+            self.start_reconnect(None, wait_for_library=False)
 
-        # If opening the port succeeded, run any post-open
-        # configuration required.
+        # Keep the interface up from now on, whatever happens to the radio
         thread = threading.Thread(target=self.watchdog_loop)
         thread.daemon = True
         thread.start()
@@ -211,16 +213,6 @@ class MeshtasticInterface(Interface):
                 self.write_thread.start()
             self.online = True
 
-    def check_dest_incoming(self, data, from_addr):
-        bit_str = "{:08b}".format(int(data[0]))
-        if re.match(r'00..11..', bit_str):  # Looking for 0(check public) 0(check Single dest) 0(any context) 0(any prop type) 11(check link dest type) 00(any packet type)
-            dest = data[2:18]
-            # RNS.log(f'Routing {RNS.prettyhexrep(dest)} -> {from_addr}')
-            if len(self.dest_to_node_dict.keys()) > 20:  # Limit size to 20 pairs
-                self.dest_to_node_dict.pop(tuple(self.dest_to_node_dict.keys())[-1])
-            self.dest_to_node_dict[dest] = from_addr
-        self.process_incoming(data)
-
     # This method will be called from our read-loop
     # whenever a full packet has been received over
     # the underlying medium.
@@ -241,12 +233,7 @@ class MeshtasticInterface(Interface):
             return
         if len(self.packet_i_queue) < 256:
             # Then write the framed data to the port
-            from meshtastic import BROADCAST_ADDR
-            dest = BROADCAST_ADDR
-            if data[2:18] in self.dest_to_node_dict:  # lookup to see if destination is found
-                dest = self.dest_to_node_dict[data[2:18]]
-            handler = PacketHandler(data, self.packet_index, max_payload=self.fragment_size,
-                                    custom_destination_id=dest)
+            handler = PacketHandler(data, self.packet_index, max_payload=self.fragment_size)
             for key in handler.get_keys():
                 self.packet_i_queue.append((handler.index, key))
             self.outgoing_packet_storage[handler.index] = handler
@@ -310,7 +297,7 @@ class MeshtasticInterface(Interface):
                         data = packet_handler.process_packet(payload)
                         self.assembly_dict[packet["from"]][new_index] = packet_handler
                     if data:
-                        self.check_dest_incoming(data, packet["from"])
+                        self.process_incoming(data)
                         self.assembly_dict[packet["from"]].pop(new_index)
                     if pos < 0:  # Move to next index
                         expected = (calc_index(new_index), 1)
@@ -331,22 +318,20 @@ class MeshtasticInterface(Interface):
                 time.sleep(sleep_time)
                 continue
             data = None
-            dest = meshtastic.BROADCAST_ADDR
             while not data and self.packet_i_queue:
                 index, position = self.packet_i_queue.pop(0)
                 if index in self.outgoing_packet_storage:
                     data = self.outgoing_packet_storage[index][position]  # Get data from position
-                    if self.outgoing_packet_storage[index] is PacketHandler:
-                        dest = self.outgoing_packet_storage[index].destination_id
             if data:
                 # Update the transmitted bytes counter
                 # and ensure that all data was written
                 self.txb += len(data) - 2  # -2 for overhead
-                # RNS.log(f'Sending on dest: {dest}')
                 try:
                     self.interface.sendData(data,
                                             portNum=self.mt_bin_port,
-                                            destinationId=dest,
+                                            # Always broadcast: one transmission serves every
+                                            # tunnel node, and Meshtastic DMs use the same airtime
+                                            destinationId=meshtastic.BROADCAST_ADDR,
                                             wantAck=False,
                                             wantResponse=False,
                                             channelIndex=self.channel_index,
@@ -463,13 +448,12 @@ class MeshtasticInterface(Interface):
 class PacketHandler:
     struct_format = 'Bb'
 
-    def __init__(self, data=None, index=None, max_payload=200, custom_destination_id=None):
+    def __init__(self, data=None, index=None, max_payload=200):
         self.max_payload = max_payload
         self.index = index
         self.data_dict = {}
         self.loop_pos = 1
         self.done = False
-        self.destination_id = custom_destination_id
         if data:  # Means we are sending
             self.split_data(data)
 
